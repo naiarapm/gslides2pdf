@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gslides2pdf"
+version = "0.1.0"
+description = "Render Google Slides presentations to PDF using Chromium"
+requires-python = ">=3.9"
+dependencies = [
+    "playwright",
+    "Pillow",
+    "img2pdf",
+    "pypdf",
+]
+
+[project.scripts]
+gs2pdf = "gslides2pdf:main"
+
+[tool.setuptools]
+py-modules = ["gslides2pdf"]
