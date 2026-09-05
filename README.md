@@ -79,6 +79,7 @@ gs2pdf --profile ~/.gslides-profile "https://docs.google.com/presentation/d/PRES
 --width PIXELS          Set logical slide width (default: 1920).
 --aspect WIDTH:HEIGHT   Override the aspect ratio, for example 16:9 or 4:3.
 --scale FACTOR          Set device scale factor for sharper output (default: 2).
+--max-steps COUNT       Assume something is stuck after this many animation steps on one slide (default: 25).
 --debug-dir DIRECTORY   Save captured PNG frames for inspection.
 -q, --quiet             Suppress progress output.
 ```
