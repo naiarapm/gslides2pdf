@@ -31,6 +31,25 @@ class ArgumentValidationTests(unittest.TestCase):
         self.assertEqual(parameters["settle"].default, 0.5)
         self.assertEqual(parameters["max_steps"].default, 25)
 
+    def test_non_negative_int_accepts_zero_but_not_negatives(self):
+        self.assertEqual(gslides2pdf.non_negative_int("0"), 0)
+        self.assertEqual(gslides2pdf.non_negative_int("3"), 3)
+        for value in ("-1", "invalid", "1.5"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                gslides2pdf.non_negative_int(value)
+
+    def test_slide_selection_parses_numbers_and_ranges(self):
+        self.assertEqual(gslides2pdf.slide_selection("3"), frozenset({3}))
+        self.assertEqual(gslides2pdf.slide_selection("2,5-7"),
+                         frozenset({2, 5, 6, 7}))
+        self.assertEqual(gslides2pdf.slide_selection(" 4 , 1 - 2 "),
+                         frozenset({1, 2, 4}))
+
+    def test_slide_selection_rejects_invalid_values(self):
+        for value in ("", "0", "7-5", "2..4", "last", "-3", "1,x"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                gslides2pdf.slide_selection(value)
+
     def test_aspect_ratio_parses_valid_values(self):
         self.assertEqual(gslides2pdf.aspect_ratio("16:9"), 16 / 9)
 
@@ -281,21 +300,53 @@ class CaptureStateMachineTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._run(script, n_slides_info=(5, 16 / 9), max_steps=2)
 
-    def test_off_by_one_slide_count_is_not_treated_as_failure(self):
-        # slide 2 makes real progress, then genuinely stops changing for
-        # good (the true last slide of the deck), but the export probe
-        # claims there are 3 slides -- e.g. a hidden slide present mode
-        # never navigates to. Being short by exactly one after real, sustained
-        # give-up attempts is a present-mode-vs-export quirk, not lost
-        # content, so this must succeed rather than raise.
+    def test_hidden_slides_corrects_the_expected_slide_count(self):
+        # the export probe counts 3 slides but one of them is hidden, so
+        # present mode only ever walks through 2. Told about the hidden slide
+        # up front, capture() expects 2 and finishes cleanly.
         script = [
             ("id.p1", "white"),
             ("id.p2", "gray"),
         ]
-        pages = self._run(script, n_slides_info=(3, 16 / 9), max_steps=2)
+        pages = self._run(script, n_slides_info=(3, 16 / 9), hidden_slides=1, max_steps=2)
         self.assertEqual(len(pages), 2)
         self.assertEqual(self._color_at(pages[0]), (255, 255, 255))
         self.assertEqual(self._color_at(pages[1]), (128, 128, 128))
+
+    def test_missing_slide_fails_loudly_without_the_hidden_slides_flag(self):
+        # the same deck, but nothing told capture() about the hidden slide.
+        # Now that the count is meant to be exact, being short by even one
+        # slide is a failure rather than a shrug -- the user is pointed at
+        # --hidden-slides instead of silently getting a short PDF.
+        script = [
+            ("id.p1", "white"),
+            ("id.p2", "gray"),
+        ]
+        with self.assertRaises(SystemExit):
+            self._run(script, n_slides_info=(3, 16 / 9), max_steps=2)
+
+    def test_steps_for_rolls_out_only_the_named_slides(self):
+        # slide 1 and slide 2 both animate; --steps-for must expand exactly
+        # the slides named and flatten the rest to their final state.
+        script = [
+            ("id.p1", "white"),
+            ("id.p1", "gray"),
+            ("id.p2", "red"),
+            ("id.p2", "blue"),
+            ("id.p2", "black"),
+        ]
+
+        pages = self._run(script, n_slides_info=(2, 16 / 9), step_slides=frozenset({1}))
+        self.assertEqual([self._color_at(p) for p in pages],
+                         [(255, 255, 255), (128, 128, 128), (0, 0, 255)])
+
+        pages = self._run(script, n_slides_info=(2, 16 / 9), step_slides=frozenset({2}))
+        self.assertEqual([self._color_at(p) for p in pages],
+                         [(128, 128, 128), (255, 0, 0), (0, 0, 255)])
+
+        pages = self._run(script, n_slides_info=(2, 16 / 9))
+        self.assertEqual([self._color_at(p) for p in pages],
+                         [(128, 128, 128), (0, 0, 255)])
 
     def test_stuck_slide_with_no_real_animations_does_not_duplicate_frames(self):
         # slide 1 has no animations at all, and the next slide is hidden, so
@@ -304,10 +355,10 @@ class CaptureStateMachineTests(unittest.TestCase):
         # end screen -- the deck isn't logically over, it's just stuck
         # behind unreachable hidden content). Recording every one of those
         # identical presses as a distinct "animation step" would pad
-        # --all-steps output with dozens of duplicate pages; being short by
-        # exactly one slide (the hidden one) at the end must not fail either.
+        # --all-steps output with dozens of duplicate pages. --hidden-slides
+        # accounts for the unreachable slide, so this is a clean finish.
         script = [("id.p1", "white")]
-        pages = self._run(script, n_slides_info=(2, 16 / 9), all_steps=True)
+        pages = self._run(script, n_slides_info=(2, 16 / 9), hidden_slides=1, all_steps=True)
         self.assertEqual(len(pages), 1)
         self.assertEqual(self._color_at(pages[0]), (255, 255, 255))
 

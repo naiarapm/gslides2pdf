@@ -1,6 +1,6 @@
 # gslides2pdf
 
-Render a Google Slides presentation to a rasterized PDF using Google Slides present mode. Animations are flattened to their final visible state by default, or can be exported as one PDF page per build step.
+Render a Google Slides presentation to a rasterized PDF using Google Slides present mode. Animations are flattened to their final visible state by default, or can be exported as one PDF page per build step — for the whole deck, or for a chosen subset of slides.
 
 ## Requirements
 
@@ -43,17 +43,39 @@ When `-o` is omitted, the output filename is the presentation title with a `.pdf
 gs2pdf "https://docs.google.com/presentation/d/PRESENTATION_ID/edit" -o deck.pdf
 ```
 
-Export every visible animation state as a separate PDF page:
-
-```bash
-gs2pdf "https://docs.google.com/presentation/d/PRESENTATION_ID/edit" --all-steps
-```
-
 A bare presentation ID also works:
 
 ```bash
 gs2pdf PRESENTATION_ID
 ```
+
+## Animation Steps
+
+By default every slide contributes a single page showing its final state. To write one page per visible animation state instead, for every slide in the deck:
+
+```bash
+gs2pdf "PRESENTATION_ID" --all-steps
+```
+
+To roll out only certain slides and keep the rest flattened, list them with `--steps-for`. It accepts individual numbers and ranges:
+
+```bash
+gs2pdf "PRESENTATION_ID" --steps-for 2,5-7
+```
+
+That builds out slides 2, 5, 6 and 7 step by step, while every other slide appears once in its final state. Slide numbers are 1-based positions in the presentation *as presented*, which is also the order of the slides in the output PDF; hidden slides are not counted, since present mode never shows them. `--all-steps` and `--steps-for` cannot be combined.
+
+## Hidden Slides
+
+To know how many slides to expect, the tool asks Google for the deck's own PDF export and counts its pages. That count includes hidden slides, but present mode skips them, so a deck with hidden slides ends the export short of the expected count and is reported as an incomplete capture.
+
+State the number of hidden slides to correct the count up front:
+
+```bash
+gs2pdf "PRESENTATION_ID" --hidden-slides 3
+```
+
+The expected slide count is then exact, so a short capture reliably means content was genuinely missed rather than skipped by design.
 
 ## Private Presentations
 
@@ -73,7 +95,9 @@ gs2pdf --profile ~/.gslides-profile "https://docs.google.com/presentation/d/PRES
 
 ```text
 -o, --output PATH       Set the PDF output path.
---all-steps             Write one page per visible animation state.
+--all-steps             Write one page per visible animation state, for every slide.
+--steps-for SLIDES      Do that for these slides only, for example 2,5-7.
+--hidden-slides N       Number of hidden slides in the deck, excluded from the expected slide count.
 --headed                Show the browser while rendering.
 --channel chrome        Use an installed browser instead of Playwright Chromium.
 --width PIXELS          Set logical slide width (default: 1920).

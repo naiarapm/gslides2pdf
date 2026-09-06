@@ -2,8 +2,8 @@
 """
 gslides2pdf.py — render a Google Slides deck to PDF with animations flattened
 to their FINAL state (i.e. what is on screen right before you leave the slide),
-or, with --all-steps, with one page per animation state so the PDF replays the
-build sequence.
+or, with --all-steps / --steps-for, with one page per animation state so the PDF
+replays the build sequence.
 
 Works by driving Google's own present mode in headless Chromium, so fonts and
 layout are exactly what a viewer sees. Output pages are raster images.
@@ -28,6 +28,14 @@ Usage:
 
     # one page per animation step (initial state + every visible change)
     gs2pdf "<url>" -o deck-steps.pdf --all-steps
+
+    # roll out the builds of slides 2 and 5..7 only; every other slide is
+    # flattened to its final state as usual
+    gs2pdf "<url>" -o deck.pdf --steps-for 2,5-7
+
+    # the deck has 3 hidden slides that present mode never shows, but Google's
+    # PDF export still counts them
+    gs2pdf "<url>" -o deck.pdf --hidden-slides 3
 """
 
 import argparse
@@ -75,6 +83,39 @@ def positive_int(value: str) -> int:
 
 def positive_float(value: str) -> float:
     return _positive_number(float, "must be a number", value)
+
+
+def non_negative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return number
+
+
+def slide_selection(value: str) -> frozenset:
+    """Parse "2,5-7" into {2, 5, 6, 7}: 1-based slide numbers as presented."""
+    slides = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", part)
+        if not m:
+            raise argparse.ArgumentTypeError(
+                "must be a comma-separated list of slide numbers or ranges, such as 2,5-7")
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else start
+        if start < 1:
+            raise argparse.ArgumentTypeError("slide numbers start at 1")
+        if end < start:
+            raise argparse.ArgumentTypeError(f"range {start}-{end} ends before it starts")
+        slides.update(range(start, end + 1))
+    if not slides:
+        raise argparse.ArgumentTypeError("must name at least one slide")
+    return frozenset(slides)
 
 
 def aspect_ratio(value: str) -> float:
@@ -172,7 +213,8 @@ def capture(url, out,
             profile=None, channel=None, headless=True,
             width=1920, aspect=None, scale=2,
             poll=0.1, max_wait=15.0, settle=0.5, max_steps=25,
-            debug_dir=None, all_steps=False, verbose=True):
+            hidden_slides=0, all_steps=False, step_slides=None,
+            debug_dir=None, verbose=True):
     try:
         pid = presentation_id(url)
     except ValueError as exc:
@@ -203,8 +245,20 @@ def capture(url, out,
                 if aspect is None:
                     aspect = exported_aspect
                 log(f"[info] export says {n_slides} slides, aspect {aspect:.4f}")
+                if hidden_slides:
+                    # The export counts hidden slides, present mode never shows
+                    # them. Correcting the target up front keeps every later
+                    # decision (on_last, the stuck-slide recovery, the final
+                    # completeness check) working from the real number.
+                    if hidden_slides >= n_slides:
+                        log(f"[warn] --hidden-slides {hidden_slides} is not smaller than the "
+                            f"{n_slides} slides the export reports; assuming 1 visible slide")
+                    n_slides = max(n_slides - hidden_slides, 1)
+                    log(f"[info] minus {hidden_slides} hidden slide(s): expecting {n_slides}")
             else:
                 log("[info] could not read PDF export (private deck without profile, or pypdf missing); falling back to heuristics")
+                if hidden_slides:
+                    log("[info] --hidden-slides has nothing to correct: the slide count is unknown")
             if aspect is None:
                 aspect = 16 / 9
             height = round(width / aspect)
@@ -250,9 +304,17 @@ def capture(url, out,
                 if debug_dir:
                     img.save(Path(debug_dir) / f"s{len(finals) + 1:02d}_{tag}.png")
 
+            def rolled_out(number: int) -> bool:
+                """Should slide `number` (1-based, as presented) contribute one
+                page per animation state instead of only its final state?"""
+                return all_steps or (step_slides is not None and number in step_slides)
+
             def finish_slide(reason=""):
-                finals.append(slide_frames if all_steps else [slide_frames[-1]])
-                log(f"[slide {len(finals)}] done after {steps} keypress(es), {len(slide_frames)} state(s){reason}")
+                number = len(finals) + 1
+                emitted = slide_frames if rolled_out(number) else [slide_frames[-1]]
+                finals.append(emitted)
+                log(f"[slide {number}] done after {steps} keypress(es), "
+                    f"{len(slide_frames)} state(s) -> {len(emitted)} page(s){reason}")
 
             dump("initial", last_frame)
 
@@ -373,19 +435,13 @@ def capture(url, out,
                     log(f"    keypress {steps}: max steps reached; advancing")
                     advance_requested = True
 
-            # The export endpoint and present-mode navigation don't always
-            # agree on slide count (e.g. a hidden slide the export includes
-            # but arrow keys never reach) -- being short by exactly one,
-            # right after genuinely running out of further changes, is that
-            # kind of harmless mismatch, not lost content. Being short by
-            # more than one means capture actually stalled partway through.
+            # n_slides is now the number of slides present mode should actually
+            # walk through (the export count, minus any --hidden-slides), so
+            # coming up short at all means capture really did stall partway.
             missing = (n_slides - len(finals)) if n_slides is not None else 0
-            truncated = missing > 1
-            if missing == 1:
-                log(f"[info] captured {len(finals)} slides; export reported {n_slides} -- "
-                    "likely a slide present-mode never shows (e.g. hidden), not missing content")
-            elif truncated:
-                log(f"[warn] captured {len(finals)} slides but export has {n_slides}")
+            truncated = missing > 0
+            if truncated:
+                log(f"[warn] captured {len(finals)} slides but expected {n_slides}")
         finally:
             context.close()
             if browser:
@@ -396,7 +452,8 @@ def capture(url, out,
     if truncated:
         sys.exit(f"[error] wrote {out} but only captured {len(finals)} of {n_slides} slides -- "
                  "output is incomplete. Advancing stopped responding partway through; "
-                 "try --headed to see what stalled it.")
+                 "try --headed to see what stalled it, or pass --hidden-slides N if the "
+                 "deck has slides present mode never shows.")
     log(f"[ok] wrote {out}: {len(finals)} slides, {len(pages)} pages")
 
 
@@ -435,7 +492,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("url", nargs="?", help="Google Slides URL (or bare presentation id)")
     ap.add_argument("-o", "--output", help="PDF output path (default: Google Slides title with a .pdf extension)")
-    ap.add_argument("--all-steps", action="store_true", help="emit one page per animation state (initial + each visible step) instead of only the final state")
+    steps_mode = ap.add_mutually_exclusive_group()
+    steps_mode.add_argument("--all-steps", action="store_true", help="emit one page per animation state (initial + each visible step) instead of only the final state, for every slide")
+    steps_mode.add_argument("--steps-for", type=slide_selection, metavar="SLIDES",
+                            help="roll out the animation steps of these slides only, e.g. '2,5-7'; "
+                                 "every other slide is flattened to its final state. Numbers are "
+                                 "1-based positions in the presentation as presented")
     ap.add_argument("--profile", type=Path, help="persistent browser profile dir (for private decks)")
     ap.add_argument("--login", action="store_true", help="open a window to sign in, store in --profile, exit")
     ap.add_argument("--channel", help="use installed browser instead of bundled Chromium, e.g. 'chrome'")
@@ -447,6 +509,10 @@ def main():
     ap.add_argument("--settle", type=positive_float, default=0.5, help="seconds the picture must stay unchanged to count as finished (default: 0.5)")
     ap.add_argument("--max-wait", type=positive_float, default=15.0, help="max seconds to wait for one animation step")
     ap.add_argument("--max-steps", type=positive_int, default=25, help="max animation steps per slide before assuming something is stuck (default: 25)")
+    ap.add_argument("--hidden-slides", type=non_negative_int, default=0, metavar="N",
+                    help="number of hidden slides in the deck: Google's PDF export counts them but "
+                         "present mode never shows them, so subtracting them keeps the expected "
+                         "slide count right from the start (default: 0)")
     ap.add_argument("--debug-dir", type=Path, help="dump every captured frame as PNG here")
     ap.add_argument("-q", "--quiet", action="store_true")
     a = ap.parse_args()
@@ -464,7 +530,8 @@ def main():
     capture(a.url, a.output, profile=a.profile, channel=a.channel, headless=not a.headed,
             width=a.width, aspect=a.aspect, scale=a.scale, poll=a.poll,
             max_wait=a.max_wait, settle=a.settle, max_steps=a.max_steps,
-            debug_dir=a.debug_dir, all_steps=a.all_steps, verbose=not a.quiet)
+            hidden_slides=a.hidden_slides, debug_dir=a.debug_dir,
+            all_steps=a.all_steps, step_slides=a.steps_for, verbose=not a.quiet)
 
 
 if __name__ == "__main__":
