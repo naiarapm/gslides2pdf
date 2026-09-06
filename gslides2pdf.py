@@ -359,6 +359,21 @@ def capture(url, out,
                 last_frame = frame
                 slide_frames.append(frame)
 
+            def unpend_black_frame():
+                """The tentative end-of-slideshow frame turned out to be
+                content after all, so record it as the animation step it
+                always was -- it is a keypress that changed the picture on a
+                slide present mode had not finished, which is the whole
+                definition of a step here."""
+                nonlocal pending_black_frame, steps
+                if pending_black_frame is None:
+                    return
+                steps += 1
+                log(f"    keypress {steps}: animation step (dark frame, not the end)")
+                dump(f"step{steps:02d}", pending_black_frame)
+                record(pending_black_frame)
+                pending_black_frame = None
+
             def rolled_out(number: int) -> bool:
                 """Should slide `number` (1-based, as presented) contribute one
                 page per animation state instead of only its final state?"""
@@ -384,10 +399,7 @@ def capture(url, out,
                 if new_id != current:
                     # we left the slide: a still-unconfirmed black frame was
                     # real content after all, not the end-of-slideshow screen
-                    if pending_black_frame is not None:
-                        slide_frames.append(pending_black_frame)
-                        pending_black_frame.release()
-                        pending_black_frame = None
+                    unpend_black_frame()
                     finish_slide()
                     if n_slides and len(finals) >= n_slides:
                         break
@@ -414,8 +426,10 @@ def capture(url, out,
                         finish_slide(" (end of slideshow)")
                         break
                     # false alarm: the picture moved on, so the earlier black
-                    # frame was itself a real (if brief) animation step
-                    pending_black_frame = None
+                    # frame was itself a real (if brief) animation step. Folding
+                    # it in also makes it `last_frame`, so the frame in hand is
+                    # compared against the state actually before it.
+                    unpend_black_frame()
 
                 if might_be_end and not frame.matches(last_frame):
                     pending_black_frame = frame

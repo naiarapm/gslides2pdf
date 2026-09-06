@@ -330,6 +330,24 @@ class CaptureStateMachineTests(unittest.TestCase):
         self.assertEqual(self._color_at(pages[0]), (0, 0, 0))
         self.assertEqual(self._color_at(pages[1]), (128, 128, 128))
 
+    def test_dark_animation_step_survives_the_end_of_show_false_alarm(self):
+        # slide 1 has a build step that happens to be black. With the slide
+        # count unknown, every black frame is a candidate end-of-slideshow
+        # screen, so it is held back pending confirmation -- and the next
+        # keypress disproves it by showing more of the same slide. That frame
+        # is content, and used to be thrown away instead of recorded, quietly
+        # losing a page from --all-steps output.
+        script = [
+            ("id.p1", "white"),
+            ("id.p1", "black"),   # dark build step, mistakable for the end
+            ("id.p1", "gray"),    # ...disproved: the slide had more to show
+            ("id.p2", "blue"),
+            ("id.p2", "black"),   # the real end screen, which does repeat
+        ]
+        pages = self._run(script, all_steps=True)
+        self.assertEqual([self._color_at(p) for p in pages],
+                         [(255, 255, 255), (0, 0, 0), (128, 128, 128), (0, 0, 255)])
+
     def test_unknown_slide_count_does_not_drop_or_abort_on_late_change(self):
         # slide 1 hits the per-slide step cap, then genuinely changes right
         # after giving up, then really does move on to slide 2. The slide
