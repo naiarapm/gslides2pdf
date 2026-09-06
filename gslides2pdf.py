@@ -168,14 +168,55 @@ def is_black_screen(img: Image.Image) -> bool:
     return max(st.mean) < 12 and max(st.stddev) < 20
 
 
+class Frame:
+    """One captured screenshot, kept as the PNG bytes the browser produced.
+
+    Those bytes are what eventually goes into the PDF (img2pdf embeds them
+    unchanged), so decoding is only ever needed to compare pixels -- and a
+    decoded frame costs about ten times the memory of the PNG it came from,
+    which adds up fast over a long deck. So the decode is lazy, cached only
+    while the frame is still being compared against, and dropped with
+    release() once the frame is just waiting to be written out."""
+
+    __slots__ = ("png", "_image")
+
+    def __init__(self, png: bytes):
+        self.png = png
+        self._image = None
+
+    @property
+    def image(self) -> Image.Image:
+        if self._image is None:
+            self._image = to_image(self.png)
+        return self._image
+
+    def release(self):
+        """Drop the decoded copy; .image simply decodes again if asked."""
+        self._image = None
+
+    def matches(self, other: "Frame", tol: float = 0.5) -> bool:
+        """Same picture as `other`? Identical PNG bytes settle it without
+        decoding anything -- which is the common case, since waiting for a
+        slide to settle means comparing frames that are byte-for-byte the
+        same over and over."""
+        if self.png == other.png:
+            return True
+        return frames_equal(self.image, other.image, tol)
+
+
 def deck_info_from_export(context, pid: str):
     """Use Google's PDF export (same cookies as the browser) to learn the
     number of slides and their aspect ratio. Returns (n_slides, aspect) or None."""
     try:
         r = context.request.get(f"https://docs.google.com/presentation/d/{pid}/export/pdf", timeout=60_000)
-        if not r.ok or not r.body().startswith(b"%PDF"):
+        if not r.ok:
             return None
-        reader = PdfReader(io.BytesIO(r.body()))
+        # every body() call is a fresh round-trip to the browser process, and
+        # the export of a big deck runs to several MB -- so fetch it once
+        body = r.body()
+        if not body.startswith(b"%PDF"):
+            return None
+        reader = PdfReader(io.BytesIO(body))
         box = reader.pages[0].mediabox
         return len(reader.pages), float(box.width) / float(box.height)
     except Exception:
@@ -186,17 +227,21 @@ def deck_info_from_export(context, pid: str):
 # core
 # ----------------------------------------------------------------------------
 
-def wait_settled(page, poll: float, max_wait: float, settle: float):
+def wait_settled(page, poll: float, max_wait: float, settle: float) -> Frame:
     """Screenshot repeatedly until the picture has stayed identical for
     `settle` seconds (animation finished, incl. delayed ones) or until
-    max_wait elapses. Returns the last frame."""
+    max_wait elapses. Returns the last frame.
+
+    By definition this loop only ends after several consecutive identical
+    frames, and Frame.matches() recognises those from their bytes alone, so
+    the wait costs nothing beyond the screenshots themselves."""
     t0 = time.time()
     prev = None
     stable_since = None
     while True:
-        cur = to_image(page.screenshot(type="png"))
+        cur = Frame(page.screenshot(type="png"))
         now = time.time()
-        if prev is not None and frames_equal(cur, prev):
+        if prev is not None and cur.matches(prev):
             if stable_since is None:
                 stable_since = now
             if now - stable_since >= settle:
@@ -300,9 +345,19 @@ def capture(url, out,
             pending_black_frame = None  # unconfirmed candidate end-of-slideshow frame
             log(f"[slide 1] id={current}")
 
-            def dump(tag, img):
+            def dump(tag, frame):
                 if debug_dir:
-                    img.save(Path(debug_dir) / f"s{len(finals) + 1:02d}_{tag}.png")
+                    path = Path(debug_dir) / f"s{len(finals) + 1:02d}_{tag}.png"
+                    path.write_bytes(frame.png)
+
+            def record(frame):
+                """Make `frame` this slide's newest state. Whatever it replaces
+                stays in slide_frames, but nothing compares against it again,
+                so it can drop its decoded copy and keep just the PNG."""
+                nonlocal last_frame
+                last_frame.release()
+                last_frame = frame
+                slide_frames.append(frame)
 
             def rolled_out(number: int) -> bool:
                 """Should slide `number` (1-based, as presented) contribute one
@@ -331,10 +386,12 @@ def capture(url, out,
                     # real content after all, not the end-of-slideshow screen
                     if pending_black_frame is not None:
                         slide_frames.append(pending_black_frame)
+                        pending_black_frame.release()
                         pending_black_frame = None
                     finish_slide()
                     if n_slides and len(finals) >= n_slides:
                         break
+                    last_frame.release()
                     current, last_frame, steps, duplicate_streak = new_id, frame, 0, 0
                     advance_requested = False
                     advance_attempts = 0
@@ -350,17 +407,17 @@ def capture(url, out,
                 # presses, so a dark build step that is still changing isn't
                 # mistaken for the end (which would otherwise truncate any
                 # deck with a dark section-divider slide).
-                might_be_end = (on_last or n_slides is None) and is_black_screen(frame)
+                might_be_end = (on_last or n_slides is None) and is_black_screen(frame.image)
 
                 if pending_black_frame is not None:
-                    if might_be_end and frames_equal(frame, pending_black_frame):
+                    if might_be_end and frame.matches(pending_black_frame):
                         finish_slide(" (end of slideshow)")
                         break
                     # false alarm: the picture moved on, so the earlier black
                     # frame was itself a real (if brief) animation step
                     pending_black_frame = None
 
-                if might_be_end and not frames_equal(frame, last_frame):
+                if might_be_end and not frame.matches(last_frame):
                     pending_black_frame = frame
                     log("    possible end-of-slideshow screen; confirming...")
                     continue
@@ -369,14 +426,13 @@ def capture(url, out,
                 # next slide. This avoids aborting a deck because a presentation
                 # has more builds than expected.
                 if advance_requested:
-                    if not frames_equal(frame, last_frame, tol=1e-6):
+                    if not frame.matches(last_frame, tol=1e-6):
                         # a real change slipped in after we'd already given up
                         # on this slide -- record it instead of dropping it
                         steps += 1
                         log(f"    keypress {steps}: animation step (after giving up)")
                         dump(f"step{steps:02d}", frame)
-                        last_frame = frame
-                        slide_frames.append(frame)
+                        record(frame)
                         advance_attempts = 0
                         continue
                     advance_attempts += 1
@@ -417,7 +473,7 @@ def capture(url, out,
                 # delayed animation's pause) means it's time to give up on
                 # this slide via the same advance/recovery path used for
                 # max_steps, rather than recording dozens of fake steps.
-                if frames_equal(frame, last_frame, tol=1e-6):
+                if frame.matches(last_frame, tol=1e-6):
                     duplicate_streak += 1
                     if duplicate_streak >= 2:
                         log(f"    keypress: identical frame {duplicate_streak} times in a row; advancing")
@@ -428,12 +484,18 @@ def capture(url, out,
                 steps += 1
                 log(f"    keypress {steps}: animation step")
                 dump(f"step{steps:02d}", frame)
-                last_frame = frame
-                slide_frames.append(frame)
+                record(frame)
 
                 if steps >= max_steps:
                     log(f"    keypress {steps}: max steps reached; advancing")
                     advance_requested = True
+
+            if step_slides:
+                unreached = sorted(n for n in step_slides if n > len(finals))
+                if unreached:
+                    log(f"[warn] --steps-for names slide(s) "
+                        f"{', '.join(str(n) for n in unreached)}, but the deck ends at "
+                        f"slide {len(finals)}; those were ignored")
 
             # n_slides is now the number of slides present mode should actually
             # walk through (the export count, minus any --hidden-slides), so
@@ -458,13 +520,9 @@ def capture(url, out,
 
 
 def write_pdf(frames, out):
-    out = Path(out)
-    bufs = []
-    for f in frames:
-        b = io.BytesIO()
-        f.save(b, format="PNG")
-        bufs.append(b.getvalue())
-    out.write_bytes(img2pdf.convert(bufs))
+    """Chromium screenshots are opaque PNGs, which img2pdf embeds as they are,
+    so the pages go into the PDF without ever being re-encoded."""
+    Path(out).write_bytes(img2pdf.convert([f.png for f in frames]))
 
 
 def do_login(profile, channel=None):

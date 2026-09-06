@@ -1,7 +1,10 @@
 import argparse
 import contextlib
 import io
+import struct
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from PIL import Image, ImageDraw
@@ -118,6 +121,67 @@ def _png_bytes(frame, size=(16, 9)):
     return buf.getvalue()
 
 
+def _png_data(png):
+    """The raw compressed image payload of a PNG, so a test can prove those
+    exact bytes came out the other end rather than being re-encoded."""
+    data, i = b"", 8
+    while i < len(png):
+        length, = struct.unpack(">I", png[i:i + 4])
+        if png[i + 4:i + 8] == b"IDAT":
+            data += png[i + 8:i + 8 + length]
+        i += 12 + length
+    return data
+
+
+class FrameTests(unittest.TestCase):
+    def test_identical_bytes_match_without_decoding(self):
+        # the settle loop compares the same picture over and over, so the
+        # common case must never pay for a decode
+        png = _png_bytes("white", size=(64, 64))
+        a, b = gslides2pdf.Frame(png), gslides2pdf.Frame(png)
+        self.assertTrue(a.matches(b))
+        self.assertIsNone(a._image)
+        self.assertIsNone(b._image)
+
+    def test_differing_bytes_fall_back_to_the_pixel_comparison(self):
+        blank = Image.new("RGB", (100, 100), "white")
+        dotted = blank.copy()
+        ImageDraw.Draw(dotted).point((10, 10), fill="black")
+
+        a = gslides2pdf.Frame(_png_bytes(blank))
+        b = gslides2pdf.Frame(_png_bytes(dotted))
+        self.assertNotEqual(a.png, b.png)
+        # the default tolerance still sees these as the same picture...
+        self.assertTrue(a.matches(b))
+        # ...while the strict comparison the state machine uses to mean
+        # "nothing happened at all" does not
+        self.assertFalse(a.matches(b, tol=1e-6))
+
+    def test_release_drops_the_decode_and_keeps_the_bytes(self):
+        frame = gslides2pdf.Frame(_png_bytes("white", size=(64, 64)))
+        self.assertEqual(frame.image.size, (64, 64))
+        self.assertIsNotNone(frame._image)
+        frame.release()
+        self.assertIsNone(frame._image)
+        self.assertEqual(frame.image.size, (64, 64))  # decodes again on demand
+
+
+class WritePdfTests(unittest.TestCase):
+    def test_pages_are_embedded_without_re_encoding(self):
+        frames = [gslides2pdf.Frame(_png_bytes(c, size=(120, 80)))
+                  for c in ("white", "gray", "red")]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "deck.pdf"
+            gslides2pdf.write_pdf(frames, out)
+            pdf = out.read_bytes()
+
+        self.assertTrue(pdf.startswith(b"%PDF"))
+        for frame in frames:
+            self.assertIn(_png_data(frame.png), pdf)
+            # writing the PDF must not have decoded anything either
+            self.assertIsNone(frame._image)
+
+
 class _FakeKeyboard:
     def __init__(self, page):
         self._page = page
@@ -229,17 +293,25 @@ class CaptureStateMachineTests(unittest.TestCase):
             stack.enter_context(mock.patch("gslides2pdf.time.sleep", lambda *_: None))
             if n_slides_info is not None:
                 stack.enter_context(mock.patch("gslides2pdf.deck_info_from_export", return_value=n_slides_info))
+            kwargs.setdefault("verbose", False)
             gslides2pdf.capture(
                 "https://docs.google.com/presentation/d/FAKEID000000000000000/edit",
                 "ignored.pdf",
-                poll=0, max_wait=0, settle=0, verbose=False,
+                poll=0, max_wait=0, settle=0,
                 **kwargs,
             )
         return pages[0] if pages else None
 
+    def _run_logged(self, script, **kwargs):
+        """_run, but returning capture()'s stderr log alongside the pages."""
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            pages = self._run(script, verbose=True, **kwargs)
+        return pages, log.getvalue()
+
     @staticmethod
-    def _color_at(img):
-        return img.getpixel((0, 0))
+    def _color_at(frame):
+        return frame.image.getpixel((0, 0))
 
     def test_black_slide_mid_deck_is_not_mistaken_for_end_of_show(self):
         # slide 1 ends on a legitimate black content frame (e.g. a dark
@@ -362,6 +434,33 @@ class CaptureStateMachineTests(unittest.TestCase):
         self.assertEqual(len(pages), 1)
         self.assertEqual(self._color_at(pages[0]), (255, 255, 255))
 
+    def test_captured_frames_release_their_decoded_copies(self):
+        # a decoded frame costs roughly ten times its PNG, and every frame is
+        # decoded at least once on the way through the comparisons -- so a
+        # long deck only stays affordable if frames hand that copy back once
+        # nothing compares against them any more. Only the very last frame,
+        # still live as last_frame when the loop ends, may hold one.
+        script = [
+            ("id.p1", "white"), ("id.p1", "gray"), ("id.p1", "red"),
+            ("id.p2", "blue"), ("id.p2", "green"),
+            ("id.p3", "yellow"), ("id.p3", "black"),
+        ]
+        pages = self._run(script, n_slides_info=(3, 16 / 9), all_steps=True)
+        self.assertEqual(len(pages), 6)
+        self.assertLessEqual(sum(p._image is not None for p in pages), 1)
+
+    def test_steps_for_warns_about_slides_the_deck_never_reaches(self):
+        # a typo'd or stale slide number would otherwise look like --steps-for
+        # silently doing nothing
+        script = [
+            ("id.p1", "white"),
+            ("id.p2", "gray"),
+        ]
+        pages, log = self._run_logged(script, n_slides_info=(2, 16 / 9),
+                                      step_slides=frozenset({1, 9, 12}))
+        self.assertEqual(len(pages), 2)
+        self.assertIn("--steps-for names slide(s) 9, 12", log)
+
     def test_small_area_animation_steps_are_not_dropped(self):
         # a single small element appearing on an otherwise large, unchanged
         # canvas barely moves the *average* pixel value -- comparing whole
@@ -388,9 +487,9 @@ class CaptureStateMachineTests(unittest.TestCase):
         ]
         pages = self._run(script, n_slides_info=(2, 16 / 9), all_steps=True)
         self.assertEqual(len(pages), 4)
-        self.assertEqual(pages[0].getpixel((10, 10)), (255, 255, 255))
-        self.assertEqual(pages[1].getpixel((10, 10)), (0, 0, 0))
-        self.assertEqual(pages[2].getpixel((20, 20)), (0, 0, 0))
+        self.assertEqual(pages[0].image.getpixel((10, 10)), (255, 255, 255))
+        self.assertEqual(pages[1].image.getpixel((10, 10)), (0, 0, 0))
+        self.assertEqual(pages[2].image.getpixel((20, 20)), (0, 0, 0))
         self.assertEqual(self._color_at(pages[3]), (128, 128, 128))
 
 
